@@ -1,0 +1,176 @@
+#include "evp_myvpd.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+typedef struct {
+    unsigned char *buffer;
+    size_t buffer_len;
+    int encrypt;
+    unsigned char *keys[8];
+    size_t key_len;
+} MYVPD_CTX;
+
+/* ---------------- VPD ---------------- */
+static void vpd_encrypt(unsigned char *d, size_t n) {
+    for (size_t i = 1; i < n; i++) d[i] ^= d[i-1];
+}
+static void vpd_decrypt(unsigned char *d, size_t n) {
+    for (size_t i = n-1; i > 0; i--) d[i] ^= d[i-1];
+}
+
+/* ---------------- Zigzag XOR ---------------- */
+static void zigzag_xor(unsigned char *d, size_t n, unsigned char *k, size_t kl) {
+    for (size_t i = 0; i < n; i++)
+        d[i] ^= k[i % kl];
+}
+
+/* ---------------- Intershuffle ---------------- */
+static void intershuffle(unsigned char *d, size_t n,
+                         unsigned char *K1, unsigned char *K2, unsigned char *K3,
+                         int h, int w)
+{
+    int d3 = 3;
+    for (int i = 0, idx = 0; i < h && idx < n; i++) {
+        for (int j = 0; j < w && idx < n; j++) {
+            for (int k = 0; k < d3 && idx < n; k++, idx++) {
+                int ni = K1[i] % h;
+                int nj = K2[j] % w;
+                int nk = K3[k] % d3;
+
+                int f1 = (i*w + j)*d3 + k;
+                int f2 = (ni*w + nj)*d3 + nk;
+
+                if (f1 < n && f2 < n) {
+                    unsigned char t = d[f1];
+                    d[f1] = d[f2];
+                    d[f2] = t;
+                }
+            }
+        }
+    }
+}
+
+static void reverse_intershuffle(unsigned char *d, size_t n,
+                                 unsigned char *K1, unsigned char *K2, unsigned char *K3,
+                                 int h, int w)
+{
+    int d3 = 3;
+    for (int i = h-1; i >= 0; i--) {
+        for (int j = w-1; j >= 0; j--) {
+            for (int k = d3-1; k >= 0; k--) {
+                int ni = K1[i] % h;
+                int nj = K2[j] % w;
+                int nk = K3[k] % d3;
+
+                int f1 = (i*w + j)*d3 + k;
+                int f2 = (ni*w + nj)*d3 + nk;
+
+                if (f1 < n && f2 < n) {
+                    unsigned char t = d[f1];
+                    d[f1] = d[f2];
+                    d[f2] = t;
+                }
+            }
+        }
+    }
+}
+
+/* ---------------- Core transform ---------------- */
+static unsigned char *process(unsigned char *in, size_t len,
+                              MYVPD_CTX *c, size_t *outlen)
+{
+    int pixels = (int)ceil(len / 3.0);
+    int w = (int)ceil(sqrt(pixels));
+    int h = (int)ceil((double)pixels / w);
+
+    unsigned char *buf = calloc(h*w*3, 1);
+    memcpy(buf, in, len);
+
+    if (c->encrypt) {
+        vpd_encrypt(buf, len);
+        intershuffle(buf, len, c->keys[0], c->keys[1], c->keys[2], h, w);
+        zigzag_xor(buf, len, c->keys[3], c->key_len);
+        vpd_encrypt(buf, len);
+        intershuffle(buf, len, c->keys[4], c->keys[5], c->keys[6], h, w);
+        zigzag_xor(buf, len, c->keys[3], c->key_len);
+        vpd_encrypt(buf, len);
+        zigzag_xor(buf, len, c->keys[7], c->key_len);
+    } else {
+        zigzag_xor(buf, len, c->keys[7], c->key_len);
+        vpd_decrypt(buf, len);
+        zigzag_xor(buf, len, c->keys[3], c->key_len);
+        reverse_intershuffle(buf, len, c->keys[4], c->keys[5], c->keys[6], h, w);
+        vpd_decrypt(buf, len);
+        zigzag_xor(buf, len, c->keys[3], c->key_len);
+        reverse_intershuffle(buf, len, c->keys[0], c->keys[1], c->keys[2], h, w);
+        vpd_decrypt(buf, len);
+    }
+
+    unsigned char *out = malloc(len);
+    memcpy(out, buf, len);
+    free(buf);
+    *outlen = len;
+    return out;
+}
+
+/* ---------------- EVP glue ---------------- */
+static int myvpd_init(EVP_CIPHER_CTX *ctx,
+                      const unsigned char *key,
+                      const unsigned char *iv, int enc)
+{
+    MYVPD_CTX *c = EVP_CIPHER_CTX_get_cipher_data(ctx);
+    memset(c, 0, sizeof(*c));
+    c->encrypt = enc;
+
+    FILE *f = fopen("keys_seq_u8.bin", "rb");
+    fseek(f, 0, SEEK_END);
+    c->key_len = ftell(f) / 8;
+    rewind(f);
+
+    for (int i = 0; i < 8; i++) {
+        c->keys[i] = malloc(c->key_len);
+        fread(c->keys[i], 1, c->key_len, f);
+    }
+    fclose(f);
+    return 1;
+}
+
+static int myvpd_do_cipher(EVP_CIPHER_CTX *ctx,
+                           unsigned char *out,
+                           const unsigned char *in,
+                           size_t len)
+{
+    MYVPD_CTX *c = EVP_CIPHER_CTX_get_cipher_data(ctx);
+    c->buffer = realloc(c->buffer, c->buffer_len + len);
+    memcpy(c->buffer + c->buffer_len, in, len);
+    c->buffer_len += len;
+    return 1;
+}
+
+static int myvpd_cleanup(EVP_CIPHER_CTX *ctx)
+{
+    MYVPD_CTX *c = EVP_CIPHER_CTX_get_cipher_data(ctx);
+    size_t outlen;
+    unsigned char *res = process(c->buffer, c->buffer_len, c, &outlen);
+    memcpy(c->buffer, res, outlen);
+    free(res);
+    return 1;
+}
+
+static EVP_CIPHER *myvpd = NULL;
+
+void EVP_add_cipher_myvpd(void)
+{
+    if (myvpd) return;
+    myvpd = EVP_CIPHER_meth_new(NID_undef, 1, 0);
+    EVP_CIPHER_meth_set_impl_ctx_size(myvpd, sizeof(MYVPD_CTX));
+    EVP_CIPHER_meth_set_flags(myvpd, EVP_CIPH_STREAM_CIPHER);
+    EVP_CIPHER_meth_set_init(myvpd, myvpd_init);
+    EVP_CIPHER_meth_set_do_cipher(myvpd, myvpd_do_cipher);
+    EVP_CIPHER_meth_set_cleanup(myvpd, myvpd_cleanup);
+}
+
+const EVP_CIPHER *EVP_myvpd(void) { return myvpd; }
+
