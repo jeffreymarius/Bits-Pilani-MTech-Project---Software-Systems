@@ -1,0 +1,11 @@
+sudo tcpdump -i any host 127.0.0.1 and port 8443 -w run_capture.pcap
+# stop after run: Ctrl-C
+
+SERVER_PID=$(pgrep -f vomciFunction | head -n1)
+sudo perf stat -p $SERVER_PID -o perf_run.txt -- sleep 30
+
+
+pidstat -h -p $SERVER_PID 1 30 > pidstat_run.txt
+
+watch -n 0.5 nvidia-smi
+
