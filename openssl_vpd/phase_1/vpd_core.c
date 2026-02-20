@@ -1,0 +1,327 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+
+/* ---------------------------- Types ---------------------------- */
+
+typedef struct {
+    int h;
+    int w;
+    uint8_t ***px;   // [h][w][3]
+} Image;
+
+/* ---------------------------- Image Helpers ---------------------------- */
+
+Image alloc_image(int h, int w) {
+    Image img;
+    img.h = h;
+    img.w = w;
+
+    img.px = (uint8_t ***)malloc(h * sizeof(uint8_t **));
+    for (int i = 0; i < h; i++) {
+        img.px[i] = (uint8_t **)malloc(w * sizeof(uint8_t *));
+        for (int j = 0; j < w; j++) {
+            img.px[i][j] = (uint8_t *)calloc(3, sizeof(uint8_t));
+        }
+    }
+    return img;
+}
+
+void free_image(Image img) {
+    for (int i = 0; i < img.h; i++) {
+        for (int j = 0; j < img.w; j++) {
+            free(img.px[i][j]);
+        }
+        free(img.px[i]);
+    }
+    free(img.px);
+}
+
+/* ---------------------------- Byte <-> Image ---------------------------- */
+
+Image bytes_to_image(const uint8_t *data, int len, int *origLen) {
+    *origLen = len;
+    int numPixels = (int)ceil((double)len / 3.0);
+    int w = (int)ceil(sqrt((double)numPixels));
+    int h = (int)ceil((double)numPixels / w);
+
+    Image img = alloc_image(h, w);
+
+    int idx = 0;
+    for (int i = 0; i < h; i++) {
+        for (int j = 0; j < w; j++) {
+            for (int c = 0; c < 3; c++) {
+                if (idx < len) {
+                    img.px[i][j][c] = data[idx++];
+                }
+            }
+        }
+    }
+    return img;
+}
+
+uint8_t *image_to_bytes(Image img, int origLen) {
+    uint8_t *out = (uint8_t *)malloc(origLen);
+    int idx = 0;
+
+    for (int i = 0; i < img.h && idx < origLen; i++) {
+        for (int j = 0; j < img.w && idx < origLen; j++) {
+            for (int k = 0; k < 3 && idx < origLen; k++) {
+                out[idx++] = img.px[i][j][k];
+            }
+        }
+    }
+    return out;
+}
+
+/* ---------------------------- VPD (Cumulative XOR) ---------------------------- */
+
+void vpd_encrypt(uint8_t *data, int len) {
+    for (int i = 1; i < len; i++) {
+        data[i] ^= data[i - 1];
+    }
+}
+
+void vpd_decrypt(uint8_t *data, int len) {
+    for (int i = len - 1; i > 0; i--) {
+        data[i] ^= data[i - 1];
+    }
+}
+
+/* ---------------------------- Bitstream ---------------------------- */
+
+uint8_t *image_to_bitstream(Image img, int *outLen) {
+    int total = img.h * img.w * 3;
+    uint8_t *bs = (uint8_t *)malloc(total);
+    int idx = 0;
+
+    for (int i = 0; i < img.h; i++) {
+        for (int j = 0; j < img.w; j++) {
+            for (int k = 0; k < 3; k++) {
+                bs[idx++] = img.px[i][j][k];
+            }
+        }
+    }
+    *outLen = total;
+    return bs;
+}
+
+Image bitstream_to_image(const uint8_t *bs, int h, int w, int origLen) {
+    Image img = alloc_image(h, w);
+    int idx = 0, count = 0;
+
+    for (int i = 0; i < h; i++) {
+        for (int j = 0; j < w; j++) {
+            for (int k = 0; k < 3 && count < origLen; k++) {
+                img.px[i][j][k] = bs[idx++];
+                count++;
+            }
+        }
+    }
+    return img;
+}
+
+/* ---------------------------- Intershuffling ---------------------------- */
+
+uint64_t *slice_to_u64(const uint8_t *data, int dlen, int len) {
+    uint64_t *out = (uint64_t *)malloc(len * sizeof(uint64_t));
+    for (int i = 0; i < len; i++) {
+        out[i] = (uint64_t)data[i % dlen];
+    }
+    return out;
+}
+
+Image intershuffle(Image I, uint64_t *K1, uint64_t *K2, uint64_t *K3, int origLen) {
+    Image S = alloc_image(I.h, I.w);
+
+    for (int i = 0; i < I.h; i++)
+        for (int j = 0; j < I.w; j++)
+            memcpy(S.px[i][j], I.px[i][j], 3);
+
+    int idx = 0;
+    for (int i = 0; i < I.h && idx < origLen; i++) {
+        for (int j = 0; j < I.w && idx < origLen; j++) {
+            for (int k = 0; k < 3 && idx < origLen; k++) {
+                int ni = (K1[i] % 256) % I.h;
+                int nj = (K2[j] % 256) % I.w;
+                int nk = (K3[k] % 3);
+
+                int f1 = i * I.w * 3 + j * 3 + k;
+                int f2 = ni * I.w * 3 + nj * 3 + nk;
+
+                if (f1 < origLen && f2 < origLen) {
+                    uint8_t t = S.px[i][j][k];
+                    S.px[i][j][k] = S.px[ni][nj][nk];
+                    S.px[ni][nj][nk] = t;
+                }
+                idx++;
+            }
+        }
+    }
+    return S;
+}
+
+Image reverse_intershuffle(Image I, uint64_t *K1, uint64_t *K2, uint64_t *K3, int origLen) {
+    Image R = alloc_image(I.h, I.w);
+
+    for (int i = 0; i < I.h; i++)
+        for (int j = 0; j < I.w; j++)
+            memcpy(R.px[i][j], I.px[i][j], 3);
+
+    for (int i = I.h - 1; i >= 0; i--) {
+        for (int j = I.w - 1; j >= 0; j--) {
+            for (int k = 2; k >= 0; k--) {
+                int ni = (K1[i] % 256) % I.h;
+                int nj = (K2[j] % 256) % I.w;
+                int nk = (K3[k] % 3);
+
+                int f1 = i * I.w * 3 + j * 3 + k;
+                int f2 = ni * I.w * 3 + nj * 3 + nk;
+
+                if (f1 < origLen && f2 < origLen) {
+                    uint8_t t = R.px[i][j][k];
+                    R.px[i][j][k] = R.px[ni][nj][nk];
+                    R.px[ni][nj][nk] = t;
+                }
+            }
+        }
+    }
+    return R;
+}
+
+/* ---------------------------- Zigzag XOR ---------------------------- */
+
+Image zigzag_xor(Image I, const uint8_t *K, int klen, int origLen) {
+    Image O = alloc_image(I.h, I.w);
+    int idx = 0;
+
+    for (int i = 0; i < I.h; i++) {
+        for (int j = 0; j < I.w; j++) {
+            for (int k = 0; k < 3; k++) {
+                if (idx < origLen) {
+                    O.px[i][j][k] = I.px[i][j][k] ^ K[idx % klen];
+                    idx++;
+                }
+            }
+        }
+    }
+    return O;
+}
+
+/* ---------------------------- Encryption / Decryption ---------------------------- */
+
+uint8_t *encrypt_bytes(uint8_t *data, int len, uint8_t **keys) {
+    int origLen;
+    Image img = bytes_to_image(data, len, &origLen);
+
+    int blen;
+    uint8_t *bs = image_to_bitstream(img, &blen);
+    vpd_encrypt(bs, blen);
+    Image I1 = bitstream_to_image(bs, img.h, img.w, origLen);
+
+    Image I2 = intershuffle(I1,
+        slice_to_u64(keys[0], len, img.h),
+        slice_to_u64(keys[1], len, img.w),
+        slice_to_u64(keys[2], len, 3),
+        origLen);
+
+    Image I3 = zigzag_xor(I2, keys[3], len, origLen);
+
+    bs = image_to_bitstream(I3, &blen);
+    vpd_encrypt(bs, blen);
+    Image I4 = bitstream_to_image(bs, img.h, img.w, origLen);
+
+    Image I5 = intershuffle(I4,
+        slice_to_u64(keys[4], len, img.h),
+        slice_to_u64(keys[5], len, img.w),
+        slice_to_u64(keys[6], len, 3),
+        origLen);
+
+    Image I6 = zigzag_xor(I5, keys[3], len, origLen);
+
+    bs = image_to_bitstream(I6, &blen);
+    vpd_encrypt(bs, blen);
+    Image I7 = bitstream_to_image(bs, img.h, img.w, origLen);
+
+    Image F = zigzag_xor(I7, keys[7], len, origLen);
+    return image_to_bytes(F, origLen);
+}
+
+uint8_t *decrypt_bytes(uint8_t *data, int len, uint8_t **keys) {
+    int origLen;
+    Image img = bytes_to_image(data, len, &origLen);
+    int h = img.h;
+    int w = img.w;
+
+    /* I7 = planetDec */
+    Image I7 = zigzag_xor(img, keys[7], len, origLen);
+
+    /* VPD decrypt */
+    int blen;
+    uint8_t *bs = image_to_bitstream(I7, &blen);
+    vpd_decrypt(bs, blen);
+    Image I6 = bitstream_to_image(bs, h, w, origLen);
+    free(bs);
+
+    /* Reverse zigzag */
+    Image I5 = zigzag_xor(I6, keys[3], len, origLen);
+
+    /* Reverse intershuffle (round 2) */
+    uint64_t *K4 = slice_to_u64(keys[4], len, h);
+    uint64_t *K5 = slice_to_u64(keys[5], len, w);
+    uint64_t *K6 = slice_to_u64(keys[6], len, 3);
+    Image I4 = reverse_intershuffle(I5, K4, K5, K6, origLen);
+
+    free(K4); free(K5); free(K6);
+
+    /* VPD decrypt */
+    bs = image_to_bitstream(I4, &blen);
+    vpd_decrypt(bs, blen);
+    Image I3 = bitstream_to_image(bs, h, w, origLen);
+    free(bs);
+
+    /* Reverse zigzag */
+    Image I2 = zigzag_xor(I3, keys[3], len, origLen);
+
+    /* Reverse intershuffle (round 1) */
+    uint64_t *K0 = slice_to_u64(keys[0], len, h);
+    uint64_t *K1 = slice_to_u64(keys[1], len, w);
+    uint64_t *K2 = slice_to_u64(keys[2], len, 3);
+    Image I1 = reverse_intershuffle(I2, K0, K1, K2, origLen);
+
+    free(K0); free(K1); free(K2);
+
+    /* Final VPD decrypt */
+    bs = image_to_bitstream(I1, &blen);
+    vpd_decrypt(bs, blen);
+    Image final = bitstream_to_image(bs, h, w, origLen);
+    free(bs);
+
+    return image_to_bytes(final, origLen);
+}
+
+/* ---------------------------- Demo ---------------------------- */
+
+int main() {
+    const char *msg = "OMCI over TLS certificate authentication";
+    int len = strlen(msg);
+
+    uint8_t *keys[8];
+    for (int i = 0; i < 8; i++) {
+        keys[i] = (uint8_t *)malloc(1500);
+        for (int j = 0; j < 1500; j++) {
+            keys[i][j] = (uint8_t)((i + j) % 256);
+        }
+    }
+
+    uint8_t *cipher = encrypt_bytes((uint8_t *)msg, len, keys);
+    uint8_t *plain  = decrypt_bytes(cipher, len, keys);
+
+    printf("Original : %s\n", msg);
+    printf("Recovered: %.*s\n", len, plain);
+
+    return 0;
+}
+

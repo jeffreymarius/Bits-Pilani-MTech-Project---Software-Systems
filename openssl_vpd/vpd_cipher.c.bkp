@@ -1,0 +1,107 @@
+#include <openssl/core.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#include <openssl/evp.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "vpd_core.h"   // ✅ ONLY header, not .c
+
+typedef struct {
+    uint8_t **keys;    // 8×1500 keys
+    uint8_t *buf;      // buffer for encrypt/decrypt
+    size_t buflen;     
+    size_t total;      // total input length
+    int encrypt;       // 1=encrypt,0=decrypt
+} VPD_CTX;
+
+#define VPD_KEYLEN 1500
+#define VPD_ROUNDS 8
+
+/* ------------------------ EVP callbacks ------------------------ */
+
+static void *vpd_newctx(void *provctx) {
+    VPD_CTX *c = OPENSSL_zalloc(sizeof(*c));
+    if (!c) return NULL;
+
+    c->keys = (uint8_t **)OPENSSL_zalloc(VPD_ROUNDS * sizeof(uint8_t *));
+    for (int i = 0; i < VPD_ROUNDS; i++) {
+        c->keys[i] = OPENSSL_zalloc(VPD_KEYLEN);
+    }
+    c->buf = NULL;
+    c->buflen = 0;
+    c->total = 0;
+    c->encrypt = 1;
+    return c;
+}
+
+static int vpd_init(void *vctx, const unsigned char *key,
+                    const unsigned char *iv, int enc) {
+    VPD_CTX *ctx = vctx;
+    ctx->encrypt = enc;
+
+    // Expand key (1-D from EVP) into 8×1500 keys
+    size_t klen = key ? strlen((const char*)key) : 0;
+    for (int i = 0; i < VPD_ROUNDS; i++) {
+        for (int j = 0; j < VPD_KEYLEN; j++) {
+            ctx->keys[i][j] = key ? key[(i*VPD_KEYLEN + j) % klen] : 0;
+        }
+    }
+    return 1;
+}
+
+static int vpd_update(void *vctx, unsigned char *out,
+                      size_t *outl, const unsigned char *in, size_t inl) {
+    VPD_CTX *ctx = vctx;
+    ctx->buf = (uint8_t *)realloc(ctx->buf, ctx->buflen + inl);
+    memcpy(ctx->buf + ctx->buflen, in, inl);
+    ctx->buflen += inl;
+
+    // We don't output anything yet, wait for final
+    *outl = 0;
+    return 1;
+}
+
+static int vpd_final(void *vctx, unsigned char *out, size_t *outl) {
+    VPD_CTX *ctx = vctx;
+    uint8_t *result = NULL;
+
+    if (ctx->encrypt)
+        result = encrypt_bytes(ctx->buf, ctx->buflen, ctx->keys);
+    else
+        result = decrypt_bytes(ctx->buf, ctx->buflen, ctx->keys);
+
+    memcpy(out, result, ctx->buflen);
+    *outl = ctx->buflen;
+
+    free(result);
+    free(ctx->buf);
+    ctx->buf = NULL;
+    ctx->buflen = 0;
+    return 1;
+}
+
+static void vpd_freectx(void *vctx) {
+    VPD_CTX *ctx = vctx;
+    if (!ctx) return;
+    for (int i = 0; i < VPD_ROUNDS; i++) {
+        free(ctx->keys[i]);
+    }
+    free(ctx->keys);
+    free(ctx->buf);
+    OPENSSL_free(ctx);
+}
+
+/* ------------------------ Cipher dispatch table ------------------------ */
+
+ const OSSL_DISPATCH vpd_cipher_functions[] = {
+    { OSSL_FUNC_CIPHER_NEWCTX, (void (*)(void))vpd_newctx },
+    { OSSL_FUNC_CIPHER_FREECTX, (void (*)(void))vpd_freectx },
+    { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void))vpd_init },
+    { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void))vpd_init },
+    { OSSL_FUNC_CIPHER_UPDATE, (void (*)(void))vpd_update },
+    { OSSL_FUNC_CIPHER_FINAL, (void (*)(void))vpd_final },
+    { 0, NULL }
+};
+

@@ -1,0 +1,138 @@
+#include <openssl/core.h>
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include "vpd_core.h"
+
+typedef struct {
+    uint8_t **keys;   // 8x key arrays
+    uint8_t *buf;     // buffer for partial data
+    size_t buflen;    // bytes in buffer
+    int encrypt;      // 1=encrypt, 0=decrypt
+} VPD_CTX;
+
+/* --------------------- New / Free --------------------- */
+
+static void *vpd_newctx(void *provctx)
+{
+    VPD_CTX *ctx = calloc(1, sizeof(VPD_CTX));
+    if (!ctx) return NULL;
+
+    ctx->keys = (uint8_t **)malloc(8 * sizeof(uint8_t *));
+    for (int i = 0; i < 8; i++) {
+        ctx->keys[i] = (uint8_t *)malloc(1500);
+        for (int j = 0; j < 1500; j++)
+            ctx->keys[i][j] = (uint8_t)((i + j) % 256);
+    }
+    ctx->buf = NULL;
+    ctx->buflen = 0;
+    ctx->encrypt = 1;
+
+    return ctx;
+}
+
+static void vpd_freectx(void *vctx)
+{
+    if (!vctx) return;
+    VPD_CTX *ctx = (VPD_CTX *)vctx;
+    for (int i = 0; i < 8; i++)
+        free(ctx->keys[i]);
+    free(ctx->keys);
+    free(ctx->buf);
+    free(ctx);
+}
+
+/* --------------------- Init --------------------- */
+
+static int vpd_init(void *vctx, const unsigned char *key, const unsigned char *iv,
+                    int enc)
+{
+    VPD_CTX *ctx = (VPD_CTX *)vctx;
+    ctx->encrypt = enc;
+    ctx->buflen = 0;
+    if (ctx->buf) free(ctx->buf);
+    ctx->buf = NULL;
+    (void)key;  // Already using internal keys
+    (void)iv;
+    return 1;
+}
+
+/* --------------------- Update --------------------- */
+
+static int vpd_update(void *vctx, unsigned char *out, size_t *outl,
+                      const unsigned char *in, size_t inl)
+{
+    VPD_CTX *ctx = (VPD_CTX *)vctx;
+
+    // Allocate buffer if needed
+    ctx->buf = (uint8_t *)realloc(ctx->buf, ctx->buflen + inl);
+    memcpy(ctx->buf + ctx->buflen, in, inl);
+    ctx->buflen += inl;
+
+    // Call encrypt_bytes / decrypt_bytes on full buffer
+    uint8_t *res = ctx->encrypt ?
+        encrypt_bytes(ctx->buf, ctx->buflen, ctx->keys) :
+        decrypt_bytes(ctx->buf, ctx->buflen, ctx->keys);
+
+    memcpy(out, res, ctx->buflen);
+    *outl = ctx->buflen;
+
+    free(res);
+    ctx->buflen = 0; // clear buffer after processing
+
+    return 1;
+}
+
+/* --------------------- Final --------------------- */
+
+static int vpd_final(void *vctx, unsigned char *out, size_t *outl)
+{
+    VPD_CTX *ctx = (VPD_CTX *)vctx;
+
+    if (ctx->buflen > 0) {
+        uint8_t *res = ctx->encrypt ?
+            encrypt_bytes(ctx->buf, ctx->buflen, ctx->keys) :
+            decrypt_bytes(ctx->buf, ctx->buflen, ctx->keys);
+        memcpy(out, res, ctx->buflen);
+        *outl = ctx->buflen;
+        free(res);
+        ctx->buflen = 0;
+    } else {
+        *outl = 0;
+    }
+
+    return 1;
+}
+
+/* --------------------- Get Params --------------------- */
+
+static int vpd_get_params(OSSL_PARAM params[])
+{
+    OSSL_PARAM *p;
+
+    // Stream cipher — omit OSSL_CIPHER_PARAM_MODE
+    if ((p = OSSL_PARAM_locate(params, OSSL_CIPHER_PARAM_BLOCK_SIZE)))
+        OSSL_PARAM_set_size_t(p, 1);
+    if ((p = OSSL_PARAM_locate(params, OSSL_CIPHER_PARAM_KEYLEN)))
+        OSSL_PARAM_set_size_t(p, 32);
+    if ((p = OSSL_PARAM_locate(params, OSSL_CIPHER_PARAM_IVLEN)))
+        OSSL_PARAM_set_size_t(p, 0);
+
+    return 1;
+}
+
+/* --------------------- Dispatch Table --------------------- */
+
+const OSSL_DISPATCH vpd_cipher_functions[] = {
+    { OSSL_FUNC_CIPHER_NEWCTX, (void (*)(void))vpd_newctx },
+    { OSSL_FUNC_CIPHER_FREECTX, (void (*)(void))vpd_freectx },
+    { OSSL_FUNC_CIPHER_ENCRYPT_INIT, (void (*)(void))vpd_init },
+    { OSSL_FUNC_CIPHER_DECRYPT_INIT, (void (*)(void))vpd_init },
+    { OSSL_FUNC_CIPHER_UPDATE, (void (*)(void))vpd_update },
+    { OSSL_FUNC_CIPHER_FINAL, (void (*)(void))vpd_final },
+    { OSSL_FUNC_CIPHER_GET_PARAMS, (void (*)(void))vpd_get_params },
+    { 0, NULL }
+};
+
