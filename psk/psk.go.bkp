@@ -1,0 +1,359 @@
+package psk
+
+/*
+#cgo pkg-config: openssl
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+// Forward declarations of Go-exported callbacks
+extern unsigned int go_psk_client_cb(void *ssl_ptr, char *hint, char *identity, unsigned int maxiden, unsigned char *psk, unsigned int maxpsk);
+extern unsigned int go_psk_server_cb(void *ssl_ptr, char *identity, unsigned char *psk, unsigned int maxpsk);
+
+// C wrapper for OpenSSL PSK client callback
+static unsigned int c_psk_client_cb(SSL *ssl, char *hint, char *identity, unsigned int maxiden, unsigned char *psk, unsigned int maxpsk) {
+    return go_psk_client_cb((void*)ssl, hint, identity, maxiden, psk, maxpsk);
+}
+
+// C wrapper for OpenSSL PSK server callback
+static unsigned int c_psk_server_cb(SSL *ssl, char *identity, unsigned char *psk, unsigned int maxpsk) {
+    return go_psk_server_cb((void*)ssl, identity, psk, maxpsk);
+}
+
+// Initialize OpenSSL
+static int openssl_init() {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+#else
+    OPENSSL_init_ssl(0, NULL);
+#endif
+    return 0;
+}
+
+// Create SSL_CTX configured for TLS1.3 and PSK
+static SSL_CTX* create_psk_ctx() {
+    const SSL_METHOD *method = TLS_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    if (!ctx) return NULL;
+
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+
+    SSL_CTX_set_psk_client_callback(ctx, c_psk_client_cb);
+    SSL_CTX_set_psk_server_callback(ctx, c_psk_server_cb);
+
+    return ctx;
+}
+
+// Accept wrapper for socket fd
+static int accept_fd(int listen_fd) {
+    struct sockaddr_storage sa;
+    socklen_t len = sizeof(sa);
+    int fd = accept(listen_fd, (struct sockaddr*)&sa, &len);
+    return fd;
+}
+*/
+import "C"
+
+
+import (
+    "errors"
+    "fmt"
+    "net"
+    "os"
+    "sync"
+    "time"
+    "unsafe"
+)
+
+// DLKeyGen must be provided by the user; returns the PSK bytes
+var DLKeyGen func() []byte
+
+// Initialize OpenSSL once
+var opensslOnce sync.Once
+func InitOpenSSL() {
+    opensslOnce.Do(func() {
+        C.openssl_init()
+    })
+}
+
+//export go_psk_client_cb
+func go_psk_client_cb(ssl_ptr unsafe.Pointer, hint *C.char, identity *C.char, maxiden C.uint, psk *C.uchar, maxpsk C.uint) C.uint {
+    var hintStr string
+    if hint != nil {
+        hintStr = C.GoString(hint)
+    }
+
+    fmt.Printf("DL key : %v\n",DLKeyGen())
+    key := DLKeyGen()
+    id := "client-identity"
+
+    cid := C.CString(id)
+    defer C.free(unsafe.Pointer(cid))
+
+    maxid := int(maxiden)
+    idlen := len(id)
+    if idlen+1 > maxid {
+        idlen = maxid - 1
+    }
+    C.memcpy(unsafe.Pointer(identity), unsafe.Pointer(cid), C.size_t(idlen))
+
+    keylen := len(key)
+    if keylen > int(maxpsk) {
+        keylen = int(maxpsk)
+    }
+    if keylen > 0 {
+        C.memcpy(unsafe.Pointer(psk), unsafe.Pointer(&key[0]), C.size_t(keylen))
+    }
+
+    _ = hintStr
+    return C.uint(keylen)
+}
+
+//export go_psk_server_cb
+func go_psk_server_cb(ssl_ptr unsafe.Pointer, identity *C.char, psk *C.uchar, maxpsk C.uint) C.uint {
+    var idStr string
+    if identity != nil {
+        idStr = C.GoString(identity)
+    }
+
+    key := DLKeyGen()
+    keylen := len(key)
+    if keylen > int(maxpsk) {
+        keylen = int(maxpsk)
+    }
+    if keylen > 0 {
+        C.memcpy(unsafe.Pointer(psk), unsafe.Pointer(&key[0]), C.size_t(keylen))
+    }
+
+    _ = idStr
+    return C.uint(keylen)
+}
+
+// OpenSSLListener wraps a net.Listener and uses OpenSSL for TLS
+type OpenSSLListener struct {
+    ln     net.Listener
+    ctx    *C.SSL_CTX
+    closed bool
+    mu     sync.Mutex
+}
+
+// CreateOpenSSLListener creates an OpenSSL listener using PSK
+// useCert = true loads server certificate
+func CreateOpenSSLListener(addr string, useCert bool, certFile, keyFile string) (*OpenSSLListener, error) {
+    InitOpenSSL()
+
+    ln, err := net.Listen("tcp", addr)
+    if err != nil {
+        return nil, err
+    }
+
+    ctx := C.create_psk_ctx()
+    if ctx == nil {
+        ln.Close()
+        return nil, errors.New("failed to create SSL_CTX")
+    }
+
+    if useCert {
+        ccert := C.CString(certFile)
+        ckey := C.CString(keyFile)
+        defer C.free(unsafe.Pointer(ccert))
+        defer C.free(unsafe.Pointer(ckey))
+
+        if C.SSL_CTX_use_certificate_file(ctx, ccert, C.SSL_FILETYPE_PEM) != 1 {
+            ln.Close()
+            return nil, errors.New("SSL_CTX_use_certificate_file failed")
+        }
+        if C.SSL_CTX_use_PrivateKey_file(ctx, ckey, C.SSL_FILETYPE_PEM) != 1 {
+            ln.Close()
+            return nil, errors.New("SSL_CTX_use_PrivateKey_file failed")
+        }
+    }
+
+    return &OpenSSLListener{ln: ln, ctx: ctx}, nil
+}
+
+// Accept waits for and returns the next connection
+func (l *OpenSSLListener) Accept() (net.Conn, error) {
+    rawConn, err := l.ln.Accept()
+    if err != nil {
+        return nil, err
+    }
+
+    tcpConn := rawConn.(*net.TCPConn)
+    f, err := tcpConn.File()
+    if err != nil {
+        rawConn.Close()
+        return nil, err
+    }
+    fd := C.int(f.Fd())
+    f.Close()
+
+    ssl := C.SSL_new(l.ctx)
+    if ssl == nil {
+        rawConn.Close()
+        return nil, errors.New("SSL_new failed")
+    }
+
+    if C.SSL_set_fd(ssl, fd) != 1 {
+        rawConn.Close()
+        C.SSL_free(ssl)
+        return nil, errors.New("SSL_set_fd failed")
+    }
+
+    ret := C.SSL_accept(ssl)
+    if ret != 1 {
+    errnum := C.ERR_get_error()
+    var errStr *C.char
+    if errnum != 0 {
+        errStr = C.ERR_error_string(errnum, nil)
+    }
+
+    sslErr := C.SSL_get_error(ssl, C.int(ret))
+    msg := fmt.Sprintf("SSL_accept failed (ret=%d ssl_err=%d)", int(ret), int(sslErr))
+    if errStr != nil {
+        msg += fmt.Sprintf(": %s", C.GoString(errStr))
+    }
+
+    fmt.Println("[OpenSSL] accept error:", msg)	
+        rawConn.Close()
+        C.SSL_free(ssl)
+	return nil, errors.New("SSL ACCEPT")
+    }
+
+    return &OpenSSLConn{ssl: ssl, fd: int(fd), raw: rawConn}, nil
+}
+
+func (l *OpenSSLListener) Close() error {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+    if l.closed {
+        return nil
+    }
+    l.closed = true
+    if l.ln != nil {
+        l.ln.Close()
+    }
+    if l.ctx != nil {
+        C.SSL_CTX_free(l.ctx)
+    }
+    return nil
+}
+
+func (l *OpenSSLListener) Addr() net.Addr {
+    return l.ln.Addr()
+}
+
+// OpenSSLConn implements net.Conn using OpenSSL
+type OpenSSLConn struct {
+    ssl *C.SSL
+    fd  int
+    raw net.Conn
+}
+
+func (c *OpenSSLConn) Read(b []byte) (int, error) {
+    n := C.SSL_read(c.ssl, unsafe.Pointer(&b[0]), C.int(len(b)))
+    if n <= 0 {
+        errCode := C.SSL_get_error(c.ssl, C.int(n))
+        if errCode == C.SSL_ERROR_ZERO_RETURN {
+            return 0, os.ErrClosed
+        }
+        return 0, fmt.Errorf("SSL_read error %d", int(errCode))
+    }
+    return int(n), nil
+}
+
+func (c *OpenSSLConn) Write(b []byte) (int, error) {
+    n := C.SSL_write(c.ssl, unsafe.Pointer(&b[0]), C.int(len(b)))
+    if n <= 0 {
+        errCode := C.SSL_get_error(c.ssl, C.int(n))
+        return 0, fmt.Errorf("SSL_write error %d", int(errCode))
+    }
+    return int(n), nil
+}
+
+func (c *OpenSSLConn) Close() error {
+    if c.ssl != nil {
+        C.SSL_shutdown(c.ssl)
+        C.SSL_free(c.ssl)
+        c.ssl = nil
+    }
+    if c.raw != nil {
+        return c.raw.Close()
+    }
+    return nil
+}
+
+func (c *OpenSSLConn) LocalAddr() net.Addr  { return c.raw.LocalAddr() }
+func (c *OpenSSLConn) RemoteAddr() net.Addr { return c.raw.RemoteAddr() }
+func (c *OpenSSLConn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
+func (c *OpenSSLConn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
+func (c *OpenSSLConn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
+
+// OpenSSLDial creates a client connection using PSK and optional certificate
+func OpenSSLDial(addr string, useCert bool, certFile, keyFile string) (net.Conn, error) {
+    InitOpenSSL()
+
+    tcpConn, err := net.Dial("tcp", addr)
+    if err != nil {
+        return nil, err
+    }
+
+    ctx := C.create_psk_ctx()
+    if ctx == nil {
+        tcpConn.Close()
+        return nil, errors.New("failed to create SSL_CTX")
+    }
+
+    if useCert {
+        ccert := C.CString(certFile)
+        ckey := C.CString(keyFile)
+        defer C.free(unsafe.Pointer(ccert))
+        defer C.free(unsafe.Pointer(ckey))
+        if C.SSL_CTX_use_certificate_file(ctx, ccert, C.SSL_FILETYPE_PEM) != 1 {
+            tcpConn.Close()
+            return nil, errors.New("client cert load failed")
+        }
+        if C.SSL_CTX_use_PrivateKey_file(ctx, ckey, C.SSL_FILETYPE_PEM) != 1 {
+            tcpConn.Close()
+            return nil, errors.New("client key load failed")
+        }
+    }
+
+    tcp := tcpConn.(*net.TCPConn)
+    f, err := tcp.File()
+    if err != nil {
+        tcpConn.Close()
+        return nil, err
+    }
+    fd := C.int(f.Fd())
+    f.Close()
+
+    ssl := C.SSL_new(ctx)
+    if ssl == nil {
+        tcpConn.Close()
+        return nil, errors.New("SSL_new failed")
+    }
+
+    if C.SSL_set_fd(ssl, fd) != 1 {
+        tcpConn.Close()
+        C.SSL_free(ssl)
+        return nil, errors.New("SSL_set_fd failed")
+    }
+
+    if C.SSL_connect(ssl) != 1 {
+        tcpConn.Close()
+        C.SSL_free(ssl)
+        return nil, errors.New("SSL_connect failed")
+    }
+
+    return &OpenSSLConn{ssl: ssl, fd: int(fd), raw: tcpConn}, nil
+}
+
