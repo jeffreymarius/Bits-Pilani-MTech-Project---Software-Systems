@@ -1,0 +1,8 @@
+64-byte PSK generation metadata
+---------------------------------
+PSK file: ../project/psk/psk_64.bin
+Salt file: ../project/psk/psk_salt_64.bin
+PSK length (bytes): 64
+Salt length (bytes): 64
+Canonicalized IKM preview: b'0.167028508667028,0.218759064422013,0.102413674160487,0.135953489743600,0.163830234478664,0.105579707130120,0.128122161302426,0.151569693298634'
+Keep psk_64.bin SECRET. Salt may be public.
