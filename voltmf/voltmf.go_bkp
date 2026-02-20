@@ -1,0 +1,400 @@
+package main
+
+import (
+	"fmt"
+	"net"
+	"io"
+	"context"
+	pb "project/proto/nbi"
+	"flag"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"log"
+	"time"
+	"strings"
+	"github.com/fsnotify/fsnotify"
+	//"google.golang.org/grpc/credentials"
+	"io/ioutil"
+	"crypto/tls"
+	"crypto/x509"
+	"sync"
+	"os"
+        opensslcgo "project/psk"
+	"encoding/hex"
+)
+
+var (
+	addr = flag.String("addr", "localhost:50051", "the address to connect to")
+	tlsFlag  = flag.Bool("tls1.3",  false, "If TLS 1.3 to be enabled")
+	tls12Flag = flag.Bool("tls1.2", false, "If TLS 1.2 to be enabled")
+)
+func trimNewlines(s string) string {
+	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func DLKeyGen() []byte {
+    // Replace with your DL model output
+    data, err := os.ReadFile("../psk/psk.key")
+    if err != nil {
+	    log.Fatalf("Failed to read key file: %v", err)
+    }
+    keyStr := string(data)
+    keyStr = string([]byte(keyStr))
+    keyStr = trimNewlines(keyStr)
+    keyBytes, err := hex.DecodeString(keyStr)
+    if err != nil {
+	    log.Fatalf("Failed to decode hex key: %v", err)
+    }
+
+    return keyBytes
+    //return []byte("0123456789abcdef0123456789abcdef") // 32 bytes (example)
+}
+/*
+func DLKeyGen() []byte {
+	return []byte("0123456789abcdef0123456789abcdef")
+}
+*/
+
+func init() {
+    opensslcgo.DLKeyGen = DLKeyGen
+}
+
+
+var (
+	voltmfCertMutex sync.RWMutex
+	voltmfCert      *tls.Certificate
+	cacertPool      *x509.CertPool
+)
+
+const (
+	voltmfCertFile = "../cert/voltmf_cert/client/voltmfClnt.crt"
+	voltmfKey      = "../cert/voltmf_cert/client/voltmfClnt.key"
+	caCertFile     = "../cert/ca/ca.crt"
+)
+
+func loadClientCerts() error {
+	newCert, err := tls.LoadX509KeyPair(voltmfCertFile, voltmfKey)
+	if err != nil {
+		return fmt.Errorf("load Cert failed %v\n",err)
+	}
+	
+	newCA, err := ioutil.ReadFile(caCertFile)
+	if err != nil {
+		return fmt.Errorf("load of CA failed %v\n",err)
+	}
+
+	newCAPool := x509.NewCertPool()
+	newCAPool.AppendCertsFromPEM(newCA)
+
+	voltmfCertMutex.Lock()
+	voltmfCert = &newCert
+	cacertPool = newCAPool
+	voltmfCertMutex.Unlock()
+
+	fmt.Printf("Client certs loaded")
+	return nil
+}
+
+func watchClientCerts() {
+	watcher,_ := fsnotify.NewWatcher()
+	defer watcher.Close()
+
+	for _,f := range []string{voltmfCertFile,voltmfKey} {
+		watcher.Add(f)
+	}
+
+	for {
+		select {
+		case event := <-watcher.Events:
+			if event.Op&(fsnotify.Write | fsnotify.Create) != 0{
+				log.Println("Client cert changed,%v",event.Name)
+				if err := loadClientCerts(); err != nil {
+					log.Println("Failed to load certs: %v", err)
+				}
+				
+			}
+		case err := <-watcher.Errors:
+			log.Println("Watcher error %v",err)
+		}
+	}
+}
+
+func opensslDialer(ctx context.Context, addr string) (net.Conn, error) {
+    // DL key is provided inside DLKeyGen
+    // useCert=false for PSK-only, set true to use client cert
+    conn, err := opensslcgo.OpenSSLDial(addr, false, voltmfCertFile, voltmfKey)
+    return conn, err
+}
+
+func dynamicTlsConfig() (*tls.Config) {
+        keylogFile, _ := os.OpenFile("/tmp/sslkeys.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if(*tls12Flag) {
+		fmt.Printf("Tls1.2 initaited")
+                return &tls.Config {
+                        MinVersion : tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			},
+                        RootCAs    : cacertPool,
+                        //Certificates: []tls.Certificate{*voltmfCert},
+                        KeyLogWriter: keylogFile,
+                        GetClientCertificate : func (*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+                                voltmfCertMutex.RLock()
+                                defer voltmfCertMutex.RUnlock()
+                                return voltmfCert, nil
+                        },
+                        ServerName:   "localhost",
+                }
+
+	} else {
+		fmt.Printf("Tls1.3 initiated")
+		return &tls.Config {
+			MinVersion : tls.VersionTLS13,
+			RootCAs    : cacertPool,
+			//Certificates: []tls.Certificate{*voltmfCert},
+			KeyLogWriter: keylogFile,
+			GetClientCertificate : func (*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				voltmfCertMutex.RLock()
+				defer voltmfCertMutex.RUnlock()
+				return voltmfCert, nil
+			},
+			ServerName:   "localhost",
+		}
+	}
+}
+
+func fillHelloReq() (*pb.Msg) {
+	msg := &pb.Msg {
+		Header: &pb.Header {
+			MsgId : "1234",
+        SenderName:    "client-1",
+        RecipientName: "vomci-function-1",
+        ObjectType:    pb.Header_VOMCI_FUNCTION,
+        ObjectName:    "vomci-fn-1",
+    },
+    Body: &pb.Body{
+        MsgBody: &pb.Body_Request{
+            Request: &pb.Request{
+                ReqType: &pb.Request_Hello{
+                    Hello: &pb.Hello{
+                        ServiceEndpointName: "my-endpoint",
+                    },
+                },
+            },
+        },
+    },
+}
+
+    return msg
+}
+
+func generateHelloRpc() {
+	flag.Parse()
+
+	var conn *grpc.ClientConn
+	var err error
+	if(*tlsFlag || *tls12Flag) {
+        conn, err = grpc.Dial(
+            *addr,
+            grpc.WithContextDialer(opensslDialer),
+            grpc.WithTransportCredentials(insecure.NewCredentials()), // transport is already secured by underlying conn
+        )
+	} else {
+		conn, err = grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	if err != nil {
+		log.Fatalf("Unable to connect: %v", err)
+	}
+
+	defer conn.Close()
+
+        cli_rpc := pb.NewVomciMessageNbiClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	msg := fillHelloReq()
+
+	res,_ := cli_rpc.Hello(ctx, msg)
+
+	fmt.Printf("Hello Message reply : %v\n",res)
+}
+
+func fillGetOntOperReq() (*pb.Msg) {
+        msg := &pb.Msg {
+                Header: &pb.Header {
+                        MsgId : "1234",
+        SenderName:    "voltmf",
+        RecipientName: "vomci-function-1",
+        ObjectType:    pb.Header_VOMCI_FUNCTION,
+        ObjectName:    "vomci-fn-1",
+    },
+    Body: &pb.Body{
+        MsgBody: &pb.Body_Request{
+            Request: &pb.Request{
+                ReqType: &pb.Request_GetData{
+                        GetData: &pb.GetData {
+				Filter : [][]byte {
+					[]byte("onuG"),
+					[]byte("onu2G"),
+				},
+			},
+                    },
+                },
+            },
+        },
+    }
+    return msg
+}
+
+func fillSetOntTod() (*pb.Msg) {
+        msg := &pb.Msg {
+                Header: &pb.Header {
+                        MsgId : "1234",
+        SenderName:    "voltmf",
+        RecipientName: "vomci-function-1",
+        ObjectType:    pb.Header_VOMCI_FUNCTION,
+        ObjectName:    "vomci-fn-1",
+    },
+    Body: &pb.Body{
+        MsgBody: &pb.Body_Request{
+            Request: &pb.Request{
+                ReqType: &pb.Request_ReplaceConfig{
+                        ReplaceConfig: &pb.ReplaceConfig {
+                                ConfigInst : []byte("ontTodConfig"),
+                                },
+                        },
+                    },
+                },
+            },
+        }
+    return msg	
+}
+
+
+func generateGetOntOperReq() {
+        defer func() {
+            if r := recover(); r != nil {
+                log.Printf("Recovered loop panic: %v\n", r)
+            }
+        }()
+
+        flag.Parse()
+
+	var conn *grpc.ClientConn
+	var err error
+        if(*tlsFlag || *tls12Flag) {
+		fmt.Printf("Using Secure comm\n")
+        conn, err = grpc.Dial(
+            *addr,
+            grpc.WithContextDialer(opensslDialer),
+            grpc.WithTransportCredentials(insecure.NewCredentials()), // transport is already secured by underlying conn
+        )
+        } else {
+                conn, err = grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+        }
+
+
+        if err != nil {
+                log.Fatalf("Unable to connect: %v", err)
+        }
+
+     //   defer conn.Close()
+
+        cli_rpc := pb.NewVomciMessageNbiClient(conn)
+
+        ctx, cancel := context.WithTimeout(context.Background(), time.Second * 10)
+        defer cancel()
+
+        msg := fillGetOntOperReq()
+
+        res,_ := cli_rpc.GetData(ctx, msg)
+
+        fmt.Printf("Get Ont Oper Message reply : %v\n",res)	
+}
+
+func generateSetTod() {
+        flag.Parse()
+        conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+        if err != nil {
+                log.Fatalf("Unable to connect: %v", err)
+        }
+
+        defer conn.Close()
+
+        cli_rpc := pb.NewVomciMessageNbiClient(conn)
+
+        ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+        defer cancel()
+
+        msg := fillSetOntTod()
+
+        res,_ := cli_rpc.Hello(ctx, msg)
+
+        fmt.Printf("Set ToD Message reply : %v\n",res)	
+}
+
+func recvFromCli() {
+	conn, err := net.Listen("tcp", "localhost:8080")
+	if err != nil {
+		panic(err)
+	}
+
+	defer conn.Close()
+
+	for {
+		client, err := conn.Accept()
+
+		if err != nil {
+			panic(err)
+		}
+
+		go func(clnt io.Reader) {
+			buffer := make([]byte, 1024)
+
+			num,err := clnt.Read(buffer)
+			if err != nil {
+				panic(err)
+			}
+
+			input := buffer[:num]
+			switch strings.TrimSpace((string(input))) {
+			case "send_hello":
+				generateHelloRpc()
+			case "getOntOper":
+				generateGetOntOperReq()
+			case "setTOD":
+				generateSetTod()
+			default :
+				fmt.Printf("Cmd %s not available to process",string(buffer))
+			}
+		}(client)
+	}
+}
+
+func main() {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("MAIN recovered from panic: %v\n", r)
+        }
+    }()
+	
+	fmt.Println("starting voltmf")
+
+	if err := loadClientCerts(); err != nil {
+		log.Fatal("Initial TLS load failed:", err)
+	}
+
+//	flag.Parse()
+//	fmt.Printf("add %v tls %v\n",*addr,*tlsFlag)
+	go watchClientCerts()
+
+	go recvFromCli()
+
+	select {}
+}
